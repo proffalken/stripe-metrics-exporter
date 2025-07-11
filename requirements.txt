@@ -1,0 +1,4 @@
+stripe==12.3.0
+prometheus-client==0.22.1
+pytest==7.4.0
+
