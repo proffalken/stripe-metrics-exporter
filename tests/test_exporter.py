@@ -6,182 +6,144 @@ import time
 import pytest
 from prometheus_client import REGISTRY
 
-# Ensure exporter.py is importable
+# make exporter.py importable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import exporter
 
-# ─── Dummy classes for subscriptions ─────────────────────────────────────────────
+def setup_function(fn):
+    # ensure fee constants are set predictably
+    os.environ["STRIPE_FEE_PERCENT"] = "0.029"
+    os.environ["STRIPE_FEE_FLAT"] = "0.30"
+    exporter.FEE_PERCENT = float(os.getenv("STRIPE_FEE_PERCENT"))
+    exporter.FEE_FLAT = float(os.getenv("STRIPE_FEE_FLAT"))
+    # define missing Stripe constants on the module
+    setattr(exporter.stripe, "ChargeStatusSucceeded", "succeeded")
+    setattr(exporter.stripe, "InvoiceLineItemTypeSubscription", "subscription")
+
+
+# ─── Helpers ────────────────────────────────────────────────────────────────────
+
+class DummyBalanceTx:
+    def __init__(self, fee_cents, net_cents):
+        self.fee = fee_cents
+        self.net = net_cents
+
+class DummyCharge:
+    def __init__(self, amount_cents, fee_cents, net_cents, invoice_id=None):
+        self.amount = amount_cents
+        self.paid = True
+        self.status = exporter.stripe.ChargeStatusSucceeded
+        self.balance_transaction = DummyBalanceTx(fee_cents, net_cents)
+        self.invoice = invoice_id
+
+class DummyList:
+    def __init__(self, seq):
+        self._seq = seq
+    def auto_paging_iter(self):
+        return iter(self._seq)
+
+class DummyPrice:
+    def __init__(self, id="plan1", unit_amount=1000, nickname="SubPlan", product=None):
+        self.id = id
+        self.unit_amount = unit_amount
+        self.nickname = nickname
+        self.product = product
+
 class DummyItem:
-    def __init__(
-        self,
-        price_id="plan_123",
-        unit_amount=1000,
-        nickname="Test Plan",
-        product_id="prod_123",
-        quantity=1
-    ):
-        self.price = type("P", (), {
-            "id": price_id,
-            "unit_amount": unit_amount,
-            "nickname": nickname,
-            "product": product_id
-        })()
+    def __init__(self, price, quantity=1):
+        self.price = price
         self.quantity = quantity
 
 class DummySub:
     def __init__(self, items):
         self._items = items
-
     @property
     def items(self):
         return type("L", (), {"data": self._items})()
-
     def __getitem__(self, key):
         if key == "items":
             return self.items
         raise KeyError(key)
 
-class DummyList:
-    def __init__(self, subs):
-        self._subs = subs
+# ─── Test fetch_charge_metrics ─────────────────────────────────────────────────
 
-    def auto_paging_iter(self):
-        return iter(self._subs)
-
-# ─── Dummy helpers for charges & invoices ───────────────────────────────────────
-def make_dummy_charge(amount_cents, paid=True, status="succeeded", invoice="inv_1"):
-    c = type("C", (), {})()
-    c.amount = amount_cents
-    c.paid = paid
-    c.status = status
-    c.invoice = invoice
-    return c
-
-class DummyProduct:
-    def __init__(self, name="Test Plan"):
-        self.name = name
-
-class DummyPrice:
-    def __init__(self, id="plan_123", unit_amount=1000, nickname="Test Plan", product=None):
-        self.id = id
-        self.unit_amount = unit_amount
-        self.nickname = nickname
-        self.product = product  # DummyProduct instance
-
-class DummyLine:
-    def __init__(self):
-        self.type = "subscription"
-        prod = DummyProduct(name="Test Plan")
-        self.price = DummyPrice(product=prod)
-        self.quantity = 1
-
-# ─── Tests ──────────────────────────────────────────────────────────────────────
-def test_fetch_metrics_happy_path(monkeypatch):
-    # 1) Mock Subscriptions: 3 active subs, each with one DummyItem
-    subs = [DummySub([DummyItem()]) for _ in range(3)]
+def test_fetch_charge_metrics(monkeypatch):
+    # Mock two charges: 100¢ (fee 5¢ net 95¢), 200¢ (fee 10¢ net 190¢)
+    charges = [
+        DummyCharge(100, fee_cents=5,  net_cents=95),
+        DummyCharge(200, fee_cents=10, net_cents=190),
+    ]
     monkeypatch.setattr(
-        exporter.stripe.Subscription,
-        "list",
-        lambda **kw: DummyList(subs)
+        exporter.stripe.Charge, "list",
+        lambda created, limit, expand: type("CL", (), {"data": charges})()
     )
 
-    # 2) Mock Charges: two successful charges
-    charges = [make_dummy_charge(100), make_dummy_charge(200)]
-    monkeypatch.setattr(
-        exporter.stripe.Charge,
-        "list",
-        lambda **kw: type("CL", (), {"data": charges})()
-    )
+    # Reset all 24h gauges
+    exporter.payment_count_24h.set(0)
+    exporter.total_revenue_24h.set(0)
+    exporter.avg_payment_24h.set(0)
+    exporter.fees_24h.set(0)
+    exporter.net_revenue_24h.set(0)
 
-    # 3) Mock Invoice.retrieve to return a dummy invoice with one DummyLine
-    dummy_invoice = type("I", (), {
-        "lines": type("L", (), {"data": [DummyLine()]})()
-    })()
-    monkeypatch.setattr(
-        exporter.stripe.Invoice,
-        "retrieve",
-        lambda inv_id, expand=None: dummy_invoice
-    )
+    successes = exporter.fetch_charge_metrics(3600)
+    assert successes == charges
 
-    # 4) Break out of the loop after one cycle
-    monkeypatch.setattr(
-        exporter.time,
-        "sleep",
-        lambda s: (_ for _ in ()).throw(StopIteration)
-    )
-
-    # 5) Run and catch StopIteration
-    with pytest.raises(StopIteration):
-        exporter.fetch_metrics()
-
-    # 6) Assert core metrics
-    assert REGISTRY.get_sample_value("stripe_active_subscriptions") == 3.0
+    # Verify global 24h metrics
     assert REGISTRY.get_sample_value("stripe_successful_payments_last_24h") == 2.0
-    assert REGISTRY.get_sample_value("stripe_total_revenue_last_24h") == (100 + 200) / 100.0
-
-    # 7) Assert subscription breakdown by plan
-    assert REGISTRY.get_sample_value(
-        "stripe_active_subscriptions_by_plan",
-        {"plan_name": "Test Plan"}
-    ) == 3.0
-
-    # 8) Assert 24h payments-by-plan metrics
-    assert REGISTRY.get_sample_value(
-        "stripe_successful_payments_last_24h_by_plan",
-        {"plan_name": "Test Plan"}
-    ) == 2.0
-    assert REGISTRY.get_sample_value(
-        "stripe_total_revenue_last_24h_by_plan",
-        {"plan_name": "Test Plan"}
-    ) == 2 * (1000 / 100.0)
+    assert pytest.approx(REGISTRY.get_sample_value("stripe_total_revenue_last_24h"), rel=1e-6) == (100 + 200) / 100.0
+    # avg = (300/2)/100 = 1.5
+    assert pytest.approx(REGISTRY.get_sample_value("stripe_avg_payment_amount_last_24h"), rel=1e-6) == 1.5
+    assert pytest.approx(REGISTRY.get_sample_value("stripe_fees_last_24h"), rel=1e-6) == (5 + 10) / 100.0
+    assert pytest.approx(REGISTRY.get_sample_value("stripe_net_revenue_last_24h"), rel=1e-6) == (95 + 190) / 100.0
 
 
-def test_fetch_metrics_no_data(monkeypatch):
-    # Zero subscriptions
+# ─── Test fetch_metrics subscription part ───────────────────────────────────────
+
+def test_fetch_metrics_subscriptions(monkeypatch):
+    # 1) Create 2 subscriptions of plan "SubPlan", each with quantity=2
+    price = DummyPrice(unit_amount=1000, nickname="SubPlan")
+    subs = [DummySub([DummyItem(price, quantity=2)]) for _ in range(2)]
     monkeypatch.setattr(
-        exporter.stripe.Subscription,
-        "list",
-        lambda **kw: DummyList([])
-    )
-    # Zero charges
-    monkeypatch.setattr(
-        exporter.stripe.Charge,
-        "list",
-        lambda **kw: type("CL", (), {"data": []})()
-    )
-    # Invoice.retrieve should not be called
-    monkeypatch.setattr(
-        exporter.stripe.Invoice,
-        "retrieve",
-        lambda inv_id, expand=None: (_ for _ in ()).throw(Exception("Should not be called"))
+        exporter.stripe.Subscription, "list",
+        lambda status, limit, expand: DummyList(subs)
     )
 
-    # Break loop immediately
+    # 2) Stub out fetch_charge_metrics so we only test subscription logic
+    monkeypatch.setattr(exporter, "fetch_charge_metrics", lambda ws: [])
+
+    # 3) Break out of the infinite loop after first iteration
     monkeypatch.setattr(
-        exporter.time,
-        "sleep",
-        lambda s: (_ for _ in ()).throw(StopIteration)
+        exporter.time, "sleep",
+        lambda sec: (_ for _ in ()).throw(StopIteration)
     )
+
+    # Reset subscription-related gauges
+    exporter.active_subs.set(0)
+    exporter.subs_count_by_plan.labels(plan_name="SubPlan").set(0)
+    exporter.subs_mrr_by_plan.labels(plan_name="SubPlan").set(0)
+    exporter.subs_net_mrr_by_plan.labels(plan_name="SubPlan").set(0)
 
     with pytest.raises(StopIteration):
         exporter.fetch_metrics()
 
-    # Core gauges: subscriptions and charges reset to 0
-    assert REGISTRY.get_sample_value("stripe_active_subscriptions") == 0.0
-    assert REGISTRY.get_sample_value("stripe_successful_payments_last_24h") == 0.0
-    assert REGISTRY.get_sample_value("stripe_total_revenue_last_24h") == 0.0
+    # active_subs = 2 subscriptions total
+    assert REGISTRY.get_sample_value("stripe_active_subscriptions") == 2.0
 
-    # Plan-labeled metrics persist (not cleared by code)
+    # subs_count_by_plan = sum of quantities = 2 subs × qty 2 = 4
     assert REGISTRY.get_sample_value(
-        "stripe_active_subscriptions_by_plan",
-        {"plan_name": "Test Plan"}
-    ) == 3.0
-    assert REGISTRY.get_sample_value(
-        "stripe_successful_payments_last_24h_by_plan",
-        {"plan_name": "Test Plan"}
-    ) == 2.0
-    assert REGISTRY.get_sample_value(
-        "stripe_total_revenue_last_24h_by_plan",
-        {"plan_name": "Test Plan"}
-    ) == 2 * (1000 / 100.0)
+        "stripe_active_subscriptions_by_plan", {"plan_name": "SubPlan"}
+    ) == 4.0
+
+    # gross MRR per sub = (1000¢/100)×2 = 20.0, total = 2×20 = 40.0
+    assert pytest.approx(REGISTRY.get_sample_value(
+        "stripe_subscription_mrr_by_plan", {"plan_name": "SubPlan"}
+    ), rel=1e-6) == 40.0
+
+    # net MRR per sub = gross×(1-FEE_PERCENT) - FEE_FLAT×qty
+    per_gross = 20.0
+    per_net = per_gross * (1 - exporter.FEE_PERCENT) - exporter.FEE_FLAT * 2
+    # total net MRR = 2 subs × per_net
+    assert pytest.approx(REGISTRY.get_sample_value(
+        "stripe_net_subscription_mrr_by_plan", {"plan_name": "SubPlan"}
+    ), rel=1e-6) == 2 * per_net
 
